@@ -33,7 +33,8 @@ import { HiOutlineArrowUpTray, HiOutlineTrash } from "react-icons/hi2";
 import Image from "next/image";
 
 
-const API = "/api/v1/creative-agent";
+// 接口跟着 basePath 走：子域部署时为空，老的 /create 路径部署时是 '/create'。
+const API = `${process.env.NEXT_PUBLIC_STUDIO_BASE_PATH || ""}/api/v1/creative-agent`;
 const GENERATION_TOOL_NAMES = new Set([
   "generate_image",
   "generate_video",
@@ -92,6 +93,19 @@ export default function CreativeCanvas({
   onGenerationEnd,
   onGenerationComplete,
   onGenerationError,
+  // fyt 本地模式：素材只留在浏览器里，不上传第三方；画布实例与工具栏由外层接管。
+  localCanvas = false,
+  active = true,
+  onLocalFiles = null,
+  isLocalSource = null,
+  onLocalClear = null,
+  onProjectDirtyChange = null,
+  canvasApiRef = null,
+  toolbarExtra = null,
+  // fyt 本地画布只接受 blob 源；远端产物在这里换成 blob 再上画布
+  resolveAsset = null,
+  // fyt 票据：直接注入请求头，不依赖 localStorage（避免令牌被覆盖或时序问题）
+  fytTicket = null,
 }) {
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -172,9 +186,10 @@ export default function CreativeCanvas({
     if (inEmbedMode) {
       return { "x-agent-embed-code": embedCode };
     }
+    if (fytTicket) return { Authorization: `Bearer ${fytTicket}` };
     const token = typeof window !== "undefined" ? localStorage.getItem("token") : null;
     return token ? { Authorization: `Bearer ${token}` } : {};
-  }, [inEmbedMode, embedCode]);
+  }, [inEmbedMode, embedCode, fytTicket]);
 
   // Persist embed session_id across page reloads so the conversation resumes.
   const setActiveEmbedSession = useCallback((id) => {
@@ -477,6 +492,20 @@ export default function CreativeCanvas({
       });
       
       if (flat.asset) {
+        if (resolveAsset && flat.asset.url && !String(flat.asset.url).startsWith("blob:")) {
+          // 远端地址在本地模式下加不进画布：先取回字节换成 blob 源，再走后面的落图逻辑。
+          void resolveAsset(flat.asset.url).then(localUrl => {
+            if (!localUrl) return;
+            // 重新走一遍事件处理，但必须是 payload 结构（processEvent 只读 ev.payload）。
+            processEvent({
+              type: "tool_result",
+              job_id: flat.job_id,
+              __resolved: true,
+              payload: { name: flat.name, result: flat.result, asset: { ...flat.asset, url: localUrl } },
+            }, msgIdx);
+          }).catch(() => {});
+          if (!flat.__resolved) return;
+        }
         setAssets(pa => {
           // Use a combination of label and url for reliable identification
           const idx = pa.findIndex(a =>
@@ -891,7 +920,9 @@ export default function CreativeCanvas({
           
           const kind = a.kind || (a.url.match(/\.(mp4|webm|mov)$/i) ? "video" : a.url.match(/\.(mp3|wav|ogg|m4a)$/i) ? "audio" : "image");
           const label = a.asset_label || null;
-          if (kind === "image") canvasRef.current.addImage(a.url, undefined, undefined, undefined, undefined, undefined, label);
+          if (kind === "image") {
+            canvasRef.current.addImage(a.url, undefined, undefined, undefined, undefined, undefined, label);
+          }
           else if (kind === "video") canvasRef.current.addVideo(a.url, undefined, undefined, undefined, undefined, undefined, label);
           else if (kind === "audio") canvasRef.current.addAudio(a.url, undefined, undefined, undefined, label);
         });
@@ -1280,11 +1311,17 @@ export default function CreativeCanvas({
           {/* Main Canvas View */}
           <div className="flex-1 relative overflow-hidden bg-bg-page/50 w-full">
             <CanvasArea 
-              ref={canvasRef} 
+              ref={node => { canvasRef.current = node; if (canvasApiRef) canvasApiRef.current = node; }}
               theme={resolvedTheme}
               activeTasks={activeTasks}
               setActiveTasks={setActiveTasks}
-              onZoomChange={setZoomLevel} 
+              onZoomChange={setZoomLevel}
+              localOnly={localCanvas}
+              active={active}
+              onLocalFiles={onLocalFiles}
+              isLocalSource={isLocalSource}
+              onLocalClear={onLocalClear}
+              onProjectDirtyChange={onProjectDirtyChange}
             />
 
             {/* Floating Toolbar */}
@@ -1296,6 +1333,7 @@ export default function CreativeCanvas({
                   <button onClick={() => canvasRef.current?.zoomIn()} className="w-5 h-5 rounded border border-divider flex items-center justify-center text-secondary-text hover:text-primary-text hover:border-primary transition-all">+</button>
                 </div>
               </div>
+              {toolbarExtra && <div className="flex items-center gap-1 pl-2 border-l border-divider">{toolbarExtra}</div>}
             </div>
           </div>
         </div>

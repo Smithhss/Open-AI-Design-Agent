@@ -20,6 +20,9 @@ import {
   Arc,
 } from "react-konva";
 import toast from "react-hot-toast";
+import { localCanvasBounds, localCanvasFit, validateCanvasText, MAX_LOCAL_NODES } from "./localCanvas";
+
+import { normalizeProjectLayout } from "./localCanvasProject";
 
 const MenuButton = ({ label, shortcut, onClick, theme }) => (
   <button
@@ -756,6 +759,13 @@ const CanvasArea = forwardRef(
       activeTasks = [],
       setActiveTasks = () => {},
       onZoomChange,
+      localOnly = false,
+      active = true,
+      onLocalFiles,
+      isLocalSource,
+      onNodeCountChange,
+      onLocalClear,
+      onProjectDirtyChange,
     },
     ref,
   ) => {
@@ -763,6 +773,10 @@ const CanvasArea = forwardRef(
     const [videos, setVideos] = useState([]);
     const [audios, setAudios] = useState([]);
     const [texts, setTexts] = useState([]);
+    const cleanDocument = useRef({ images, texts });
+    useEffect(() => {
+      if (localOnly) onProjectDirtyChange?.(cleanDocument.current.images !== images || cleanDocument.current.texts !== texts);
+    }, [images, texts, localOnly, onProjectDirtyChange]);
     const [selectedId, setSelectedId] = useState(null);
     const [canvasSize, setCanvasSize] = useState({ width: 800, height: 600 });
     const [zoom, setZoom] = useState(1);
@@ -774,11 +788,30 @@ const CanvasArea = forwardRef(
     const stageWrapperRef = useRef();
     const stageRef = useRef();
     const containerRef = useRef();
+    const localAlive = useRef(true);
+    const localEpoch = useRef(0);
+    const localIds = useRef(new Set());
+    const localPendingImages = useRef(new Map());
+    useEffect(() => {
+      localAlive.current = true;
+      return () => { localAlive.current = false; localEpoch.current++; [...localPendingImages.current.values()].forEach(cancel => cancel()); };
+    }, []);
+    useEffect(() => {
+      if (localOnly) onNodeCountChange?.(images.length + texts.length);
+    }, [localOnly, images.length, texts.length, onNodeCountChange]);
+    const reserveLocalNode = (id) => {
+      if (!localOnly) return true;
+      if (localIds.current.size >= MAX_LOCAL_NODES) {
+        toast.error("Local canvas supports up to 100 elements."); return false;
+      }
+      localIds.current.add(id); return true;
+    };
+
 
     const updateZoom = (newZoom, pos = null) => {
       if (!newZoom || isNaN(newZoom)) return;
       setZoom(newZoom);
-      onZoomChange?.(Math.round(newZoom * 100));
+      onZoomChange?.(localOnly && newZoom < 0.1 ? Number((newZoom * 100).toPrecision(2)) : Math.round(newZoom * 100));
 
       if (stageRef.current && typeof stageRef.current.scale === "function") {
         stageRef.current.scale({ x: newZoom, y: newZoom });
@@ -797,7 +830,23 @@ const CanvasArea = forwardRef(
       }
     };
 
+    const getLocalVisibleEntries = () => {
+      const stage = stageRef.current;
+      if (!stage) return [];
+      return stage.find(".konva-item").filter(node => node.visible() && node.opacity() > 0)
+        .map(node => ({ node, bounds: node.getClientRect({ relativeTo: stage }) }))
+        .filter(entry => entry.bounds.width > 0 && entry.bounds.height > 0);
+    };
+
     const handleZoomToFit = () => {
+      if (localOnly) {
+        const entries = getLocalVisibleEntries();
+        if (!entries.length) { updateZoom(1, { x: 0, y: 0 }); return; }
+        const fit = localCanvasFit(entries.map(entry => entry.bounds), canvasSize);
+        updateZoom(fit.zoom, { x: fit.x, y: fit.y });
+        return;
+      }
+
       if (
         images.length === 0 &&
         videos.length === 0 &&
@@ -838,7 +887,33 @@ const CanvasArea = forwardRef(
       updateZoom(newZoom, newPos);
     };
 
+    const handleLocalCanvasExport = () => {
+      const stage = stageRef.current;
+      if (!stage || !localAlive.current) return false;
+      let exported;
+      try {
+        const entries = getLocalVisibleEntries();
+        const bounds = localCanvasBounds(entries.map(entry => entry.bounds));
+        const container = document.createElement("div");
+        exported = new Konva.Stage({ container, width: bounds.width, height: bounds.height });
+        const layer = new Konva.Layer({ x: -bounds.x, y: -bounds.y });
+        exported.add(layer);
+        entries.forEach(({ node }) => layer.add(node.clone({ draggable: false, listening: false })));
+        exported.draw();
+        const link = document.createElement("a");
+        link.download = "fyt-local-canvas.png";
+        link.href = exported.toDataURL({ pixelRatio: 1, mimeType: "image/png" });
+        document.body.appendChild(link); link.click(); link.remove();
+        return true;
+      } catch (error) {
+        toast.error(error.message === "CANVAS_EMPTY" ? "Canvas is empty. Add an image or text first." :
+          error.message === "CANVAS_EXPORT_TOO_LARGE" ? "Content is too spread out to export (8192px / 16MP limit). Move elements closer together." : "Could not export the canvas. Your content is still available.");
+        return false;
+      } finally { exported?.destroy(); setContextMenu(null); }
+    };
+
     const handleExport = (format) => {
+      if (localOnly) return handleLocalCanvasExport();
       if (!contextMenu?.nodeId) return;
       const id = contextMenu.nodeId;
       const node = stageRef.current.findOne("#" + id);
@@ -870,6 +945,7 @@ const CanvasArea = forwardRef(
     };
 
     const handleDownload = async () => {
+      if (localOnly) return handleLocalCanvasExport();
       const id = contextMenu?.nodeId || selectedId;
       if (!id) return;
 
@@ -920,17 +996,22 @@ const CanvasArea = forwardRef(
 
     const handleClearCanvas = () => {
       if (window.confirm("Are you sure you want to clear the entire canvas?")) {
+        if (localOnly) { localEpoch.current++; [...localPendingImages.current.values()].forEach(cancel => cancel()); localIds.current.clear(); setClipboardNode(null); setEditingTextId(null); onLocalClear?.(); }
         setImages([]);
         setVideos([]);
         setAudios([]);
         setTexts([]);
         setSelectedId(null);
         toast.success("Canvas cleared");
+        setContextMenu(null);
+        return true;
       }
       setContextMenu(null);
+      return false;
     };
 
     const handleExportCanvas = () => {
+      if (localOnly) return handleLocalCanvasExport();
       if (!stageRef.current) return;
       try {
         const dataURL = stageRef.current.toDataURL({ pixelRatio: 2 });
@@ -950,6 +1031,34 @@ const CanvasArea = forwardRef(
     };
 
     const addImage = (src, x, y, width, height, onLoaded, assetLabel) => {
+      if (localOnly) {
+        const stage = stageRef.current;
+        if (!stage || typeof src !== "string" || !src.startsWith("blob:") || !isLocalSource?.(src)) { onLoaded?.(false); return; }
+        const id = `img-${crypto.randomUUID()}`;
+        if (!reserveLocalNode(id)) { onLoaded?.(false); return; }
+        const epoch = localEpoch.current;
+        const image = new window.Image();
+        const cancel = () => {
+          image.onload = null; image.onerror = null; image.src = "";
+          localIds.current.delete(id); localPendingImages.current.delete(id); onLoaded?.(false);
+        };
+        localPendingImages.current.set(id, cancel);
+        image.onload = () => {
+          if (!localAlive.current || epoch !== localEpoch.current || !isLocalSource?.(src)) { cancel(); return; }
+          image.onload = null; image.onerror = null; localPendingImages.current.delete(id);
+          const scale = Math.min(1, 400 / Math.max(image.naturalWidth, image.naturalHeight));
+          setImages(previous => [...previous, { id, src, image, x: x ?? (-stage.x() + canvasSize.width / 2) / zoom - 100,
+            y: y ?? (-stage.y() + canvasSize.height / 2) / zoom - 100,
+            width: image.naturalWidth * scale, height: image.naturalHeight * scale, rotation: 0,
+            // 没有这个字段，getCanvasState 既列不出节点，也报不出当前选中项
+            assetLabel: assetLabel || undefined }]);
+          setSelectedId(id); onLoaded?.(true);
+        };
+        image.onerror = cancel;
+        image.src = src;
+        return;
+      }
+
       if (!src) return;
       const stage = stageRef.current;
       if (!stage) {
@@ -1021,6 +1130,7 @@ const CanvasArea = forwardRef(
     };
 
     const addVideo = (src, x, y, width, height, onLoaded, assetLabel) => {
+      if (localOnly) return;
       if (!src) return;
       const stage = stageRef.current;
       if (!stage) {
@@ -1126,6 +1236,7 @@ const CanvasArea = forwardRef(
     };
 
     const addAudio = (src, x, y, label, assetLabel) => {
+      if (localOnly) return;
       console.log("audio url", src);
       
       if (!src) return;
@@ -1155,12 +1266,17 @@ const CanvasArea = forwardRef(
     };
 
     const addNewText = (text, x, y) => {
+      if (localOnly) {
+        try { text = validateCanvasText(text); } catch { toast.error("Use 1–6000 characters for canvas text."); return; }
+      }
+
       const stage = stageRef.current;
       const targetX =
         x !== undefined ? x : (-stage.x() + canvasSize.width / 2) / zoom - 50;
       const targetY =
         y !== undefined ? y : (-stage.y() + canvasSize.height / 2) / zoom - 12;
-      const id = `txt-${Date.now()}`;
+      const id = localOnly ? `txt-${crypto.randomUUID()}` : `txt-${Date.now()}`;
+      if (!reserveLocalNode(id)) return;
       setTexts((prev) => [
         ...prev,
         {
@@ -1242,8 +1358,37 @@ const CanvasArea = forwardRef(
 
       const sw = frame.width || 200;
       const sh = frame.height || 200;
-      const x = frame.x + sw + 32;   // 32px gap to the right of source
-      const y = frame.y;
+      let x = frame.x + sw + 32;   // 默认放右边，留 32px 间距
+      let y = frame.y;
+
+      // 依次尝试 右 → 下 → 上 → 左，取第一个完整落在可视区内的位置。
+      const stage = stageRef.current;
+      if (stage && canvasSize?.width && canvasSize?.height) {
+        const zoomLevel = stage.scaleX() || 1;
+        const left = -stage.x() / zoomLevel;
+        const top = -stage.y() / zoomLevel;
+        const right = left + canvasSize.width / zoomLevel;
+        const bottom = top + canvasSize.height / zoomLevel;
+        const gap = 32;
+        const fits = (px, py) => px >= left + 8 && py >= top + 8 && px + sw <= right - 8 && py + sh <= bottom - 8;
+        const candidates = [
+          [frame.x + sw + gap, frame.y],
+          [frame.x, frame.y + sh + gap],
+          [frame.x, frame.y - sh - gap],
+          [frame.x - sw - gap, frame.y],
+        ];
+        const hit = candidates.find(([px, py]) => fits(px, py));
+        if (hit) {
+          [x, y] = hit;
+        } else {
+          // 四个方向都放不下：放右边并把视口平移过去，保证新图完整可见。
+          const [px, py] = candidates[0];
+          x = px; y = py;
+          const nx = canvasSize.width / 2 - (x + sw / 2) * zoomLevel;
+          const ny = canvasSize.height / 2 - (y + sh / 2) * zoomLevel;
+          setTimeout(() => updateZoom(zoomLevel, { x: nx, y: ny }), 0);
+        }
+      }
 
       if (newKind === "video") {
         addVideo(newUrl, x, y, sw, sh, undefined, newAssetLabel);
@@ -1269,10 +1414,55 @@ const CanvasArea = forwardRef(
       return moves.length;
     };
 
+    const getLocalProjectSnapshot = () => {
+      if (!localOnly) return null;
+      const stage = stageRef.current;
+      return {
+        nodes: [...images.map(node => ({ ...node, kind: "image" })), ...texts.map(node => ({ ...node, kind: "text" }))],
+        viewport: { x: stage?.x() ?? 0, y: stage?.y() ?? 0, zoom },
+        token: { images, texts },
+      };
+    };
+    const markLocalProjectSaved = (token) => {
+      if (!localOnly || token?.images !== images || token?.texts !== texts) return false;
+      cleanDocument.current = { images, texts };
+      onProjectDirtyChange?.(false);
+      return true;
+    };
+    const replaceLocalProject = (project, assets) => {
+      if (!localOnly) return false;
+      const layout = normalizeProjectLayout(project.nodes, project.viewport, new Set(assets.keys()));
+      const nextImages = [], nextTexts = [];
+      for (const node of layout.nodes) {
+        const { kind, assetId, ...state } = node;
+        if (kind === "image") {
+          const source = assets.get(assetId);
+          if (!source?.image || !isLocalSource?.(source.url)) return false;
+          nextImages.push({ ...state, src: source.url, image: source.image });
+        } else nextTexts.push({ ...state, draggable: true });
+      }
+      localEpoch.current++;
+      [...localPendingImages.current.values()].forEach(cancel => cancel());
+      localIds.current = new Set(layout.nodes.map(node => node.id));
+      cleanDocument.current = { images: nextImages, texts: nextTexts };
+      setClipboardNode(null); setEditingTextId(null); setSelectedId(null); setContextMenu(null); setGuides([]);
+      setImages(nextImages); setTexts(nextTexts); setVideos([]); setAudios([]);
+      updateZoom(layout.viewport.zoom, { x: layout.viewport.x, y: layout.viewport.y });
+      onProjectDirtyChange?.(false);
+      return true;
+    };
+
     useImperativeHandle(
       ref,
       () => ({
+        getLocalProjectSnapshot,
+        markLocalProjectSaved,
+        replaceLocalProject,
         addImage,
+        addText: addNewText,
+        fitAll: handleZoomToFit,
+        exportCanvas: handleExportCanvas,
+        clearCanvas: handleClearCanvas,
         addVideo,
         addAudio,
         getCanvasState,
@@ -1288,17 +1478,28 @@ const CanvasArea = forwardRef(
       }),
       // Recompute when state read by getCanvasState changes so the snapshot
       // is always current.
-      [images, videos, audios, texts, selectedId, canvasSize, zoom],
+      [images, videos, audios, texts, selectedId, canvasSize, zoom, localOnly, isLocalSource, onLocalClear, onProjectDirtyChange],
     );
 
     // Global Paste & Keyboard listeners
     useEffect(() => {
+      if (localOnly && !active) return;
       const handlePasteAction = (e) => {
         if (
           document.activeElement.tagName === "INPUT" ||
-          document.activeElement.tagName === "TEXTAREA"
+          document.activeElement.tagName === "TEXTAREA" || document.activeElement.isContentEditable
         )
           return;
+        if (localOnly) {
+          e.preventDefault();
+          const files = Array.from(e.clipboardData?.files || []);
+          if (files.length) onLocalFiles?.(files);
+          else {
+            const text = e.clipboardData?.getData("text/plain");
+            if (text?.trim()) addNewText(text);
+          }
+          return;
+        }
         const items = e.clipboardData?.items;
         for (let i = 0; i < items.length; i++) {
           if (items[i].type.indexOf("image") !== -1) {
@@ -1317,11 +1518,11 @@ const CanvasArea = forwardRef(
       };
       window.addEventListener("paste", handlePasteAction);
       return () => window.removeEventListener("paste", handlePasteAction);
-    }, [zoom, canvasSize]);
+    }, [zoom, canvasSize, localOnly, active, onLocalFiles]);
 
     // Handle tasks spawning
     useEffect(() => {
-      if (!activeTasks || activeTasks.length === 0) return;
+      if (localOnly || !activeTasks || activeTasks.length === 0) return;
       const tasksNeedingPosition = activeTasks.filter(
         (t) => t.x === undefined && t.y === undefined,
       );
@@ -1419,6 +1620,7 @@ const CanvasArea = forwardRef(
       const id = contextMenu?.nodeId || selectedId;
       if (id) {
         setClipboardNode(getActiveNode(id));
+        if (localOnly) localIds.current.delete(id);
         setImages(images.filter((img) => img.id !== id));
         setVideos(videos.filter((vid) => vid.id !== id));
         setAudios(audios.filter((aud) => aud.id !== id));
@@ -1439,6 +1641,8 @@ const CanvasArea = forwardRef(
             x: node.x + 20,
             y: node.y + 20,
           };
+          if (localOnly) newNode.id = `${node.id.split("-")[0]}-${crypto.randomUUID()}`;
+          if (!reserveLocalNode(newNode.id)) return;
           if (newNode.id.startsWith("img"))
             setImages((prev) => [...prev, newNode]);
           if (newNode.id.startsWith("vid"))
@@ -1463,6 +1667,15 @@ const CanvasArea = forwardRef(
       } else {
         x = (-stage.x() + canvasSize.width / 2) / zoom;
         y = (-stage.y() + canvasSize.height / 2) / zoom;
+      }
+      if (localOnly) {
+        if (!clipboardNode) { setContextMenu(null); return; }
+        const node = { ...clipboardNode, id: `${clipboardNode.id.split("-")[0]}-${crypto.randomUUID()}`, x, y };
+        if (!reserveLocalNode(node.id)) return;
+        if (node.id.startsWith("img") && isLocalSource?.(node.src)) setImages(previous => [...previous, node]);
+        else if (node.id.startsWith("txt")) setTexts(previous => [...previous, node]);
+        else { localIds.current.delete(node.id); return; }
+        setSelectedId(node.id); setContextMenu(null); return;
       }
       try {
         const items = await navigator.clipboard.read();
@@ -1595,6 +1808,7 @@ const CanvasArea = forwardRef(
 
     const handleDelete = () => {
       const id = contextMenu?.nodeId || selectedId;
+      if (localOnly && id) localIds.current.delete(id);
       if (id) {
         setImages(images.filter((img) => img.id !== id));
         setVideos(videos.filter((vid) => vid.id !== id));
@@ -1622,10 +1836,11 @@ const CanvasArea = forwardRef(
 
     // Keyboard Shortcuts
     useEffect(() => {
+      if (localOnly && !active) return;
       const handleKeyDown = (e) => {
         if (
           document.activeElement.tagName === "INPUT" ||
-          document.activeElement.tagName === "TEXTAREA"
+          document.activeElement.tagName === "TEXTAREA" || document.activeElement.isContentEditable
         )
           return;
         if (e.ctrlKey || e.metaKey) {
@@ -1640,7 +1855,10 @@ const CanvasArea = forwardRef(
             updateZoom(1);
           } else if (e.key === "c") handleCopy();
           else if (e.key === "x") handleCut();
-          else if (e.key === "v") handlePasteNode();
+          else if (e.key === "v") {
+            if (!localOnly) handlePasteNode();
+            else if (clipboardNode) { e.preventDefault(); handlePasteNode(); }
+          }
           else if (e.key === "d") {
             e.preventDefault();
             handleDuplicate();
@@ -1664,7 +1882,7 @@ const CanvasArea = forwardRef(
       };
       window.addEventListener("keydown", handleKeyDown);
       return () => window.removeEventListener("keydown", handleKeyDown);
-    }, [zoom, images, videos, texts, selectedId, clipboardNode]);
+    }, [zoom, images, videos, texts, selectedId, clipboardNode, localOnly, active]);
 
     // Snapping Guides
     const getLineGuide = (node) => {
@@ -1797,6 +2015,13 @@ const CanvasArea = forwardRef(
 
     const handleDrop = (e) => {
       e.preventDefault();
+      if (localOnly) {
+        e.stopPropagation();
+        const files = Array.from(e.dataTransfer.files || []);
+        if (files.length) onLocalFiles?.(files);
+        else { const text = e.dataTransfer.getData("text/plain"); if (text?.trim()) addNewText(text); }
+        return;
+      }
       const url = e.dataTransfer.getData("text/plain");
       const files = e.dataTransfer.files;
       if (url) {
@@ -1978,6 +2203,7 @@ const CanvasArea = forwardRef(
             return (
               <textarea
                 autoFocus
+                maxLength={localOnly ? 6000 : undefined}
                 value={node.text}
                 onChange={(e) =>
                   setTexts((prev) =>
@@ -2093,12 +2319,12 @@ const CanvasArea = forwardRef(
                 />
                 <MenuDivider theme={theme} />
                 <MenuButton
-                  label="Download"
+                  label={localOnly ? "Export all as PNG" : "Download"}
                   onClick={handleDownload}
                   theme={theme}
                 />
                 <MenuDivider theme={theme} />
-                {!contextMenu?.nodeId?.startsWith("aud") && (
+                {!localOnly && !contextMenu?.nodeId?.startsWith("aud") && (
                   <div className="relative group">
                     <button
                       className={`w-full text-left px-4 py-1.5 flex justify-between items-center transition-colors ${theme === "dark" ? "hover:bg-bg-page" : "hover:bg-bg-page"}`}
@@ -2138,7 +2364,7 @@ const CanvasArea = forwardRef(
             ) : (
               <>
                 <MenuButton
-                  label="Paste"
+                  label={localOnly ? "Paste copied element" : "Paste"}
                   shortcut="Ctrl+V"
                   onClick={handlePasteNode}
                   theme={theme}
