@@ -19,6 +19,7 @@ import {
   Rect,
   Arc,
 } from "react-konva";
+import { canvasText } from "./canvasLocale.mjs";
 import toast from "react-hot-toast";
 import { localCanvasBounds, localCanvasFit, validateCanvasText, MAX_LOCAL_NODES } from "./localCanvas";
 
@@ -755,6 +756,7 @@ const CanvasArea = forwardRef(
   (
     {
       theme = "dark",
+      locale = "en",
       colors = { textSecondary: "text-text-sub", border: "border-border-main" },
       activeTasks = [],
       setActiveTasks = () => {},
@@ -769,6 +771,7 @@ const CanvasArea = forwardRef(
     },
     ref,
   ) => {
+    const t = text => canvasText(locale, text);
     const [images, setImages] = useState([]);
     const [videos, setVideos] = useState([]);
     const [audios, setAudios] = useState([]);
@@ -1325,6 +1328,7 @@ const CanvasArea = forwardRef(
           pan: stage ? [Math.round(stage.x()), Math.round(stage.y())] : [0, 0],
         },
         selected: selectedNode?.assetLabel || null,
+        selected_unregistered_image: localOnly && images.some(node => node.id === selectedId && !node.assetLabel),
         nodes,
       };
     };
@@ -2251,44 +2255,44 @@ const CanvasArea = forwardRef(
             {contextMenu.type === "node" ? (
               <>
                 <MenuButton
-                  label="Copy"
+                  label={t("Copy")}
                   shortcut="Ctrl+C"
                   onClick={handleCopy}
                   theme={theme}
                 />
                 <MenuButton
-                  label="Cut"
+                  label={t("Cut")}
                   shortcut="Ctrl+X"
                   onClick={handleCut}
                   theme={theme}
                 />
                 <MenuButton
-                  label="Duplicate"
+                  label={t("Duplicate")}
                   shortcut="Ctrl+D"
                   onClick={handleDuplicate}
                   theme={theme}
                 />
                 <MenuDivider theme={theme} />
                 <MenuButton
-                  label="Bring to Front"
+                  label={t("Bring to Front")}
                   shortcut="]"
                   onClick={() => handleZIndex("front")}
                   theme={theme}
                 />
                 <MenuButton
-                  label="Send to Back"
+                  label={t("Send to Back")}
                   shortcut="["
                   onClick={() => handleZIndex("back")}
                   theme={theme}
                 />
                 <MenuButton
-                  label="Move Up"
+                  label={t("Move Up")}
                   shortcut="Ctrl+]"
                   onClick={() => handleZIndex("up")}
                   theme={theme}
                 />
                 <MenuButton
-                  label="Move Down"
+                  label={t("Move Down")}
                   shortcut="Ctrl+["
                   onClick={() => handleZIndex("down")}
                   theme={theme}
@@ -2319,7 +2323,7 @@ const CanvasArea = forwardRef(
                 />
                 <MenuDivider theme={theme} />
                 <MenuButton
-                  label={localOnly ? "Export all as PNG" : "Download"}
+                  label={t(localOnly ? "Export all as PNG" : "Download")}
                   onClick={handleDownload}
                   theme={theme}
                 />
@@ -2329,7 +2333,7 @@ const CanvasArea = forwardRef(
                     <button
                       className={`w-full text-left px-4 py-1.5 flex justify-between items-center transition-colors ${theme === "dark" ? "hover:bg-bg-page" : "hover:bg-bg-page"}`}
                     >
-                      <span>Export As</span>
+                      <span>{t("Export As")}</span>
                       <span>›</span>
                     </button>
                     <div
@@ -2355,7 +2359,7 @@ const CanvasArea = forwardRef(
                 )}
                 <MenuDivider theme={theme} />
                 <MenuButton
-                  label="Delete"
+                  label={t("Delete")}
                   shortcut="Del"
                   onClick={handleDelete}
                   theme={theme}
@@ -2364,20 +2368,20 @@ const CanvasArea = forwardRef(
             ) : (
               <>
                 <MenuButton
-                  label={localOnly ? "Paste copied element" : "Paste"}
+                  label={t(localOnly ? "Paste copied element" : "Paste")}
                   shortcut="Ctrl+V"
                   onClick={handlePasteNode}
                   theme={theme}
                 />
                 <MenuDivider theme={theme} />
                 <MenuButton
-                  label="Zoom In"
+                  label={t("Zoom In")}
                   shortcut="Ctrl++"
                   onClick={() => updateZoom(Math.min(5, zoom + 0.1))}
                   theme={theme}
                 />
                 <MenuButton
-                  label="Zoom Out"
+                  label={t("Zoom Out")}
                   shortcut="Ctrl+-"
                   onClick={() => updateZoom(Math.max(0.1, zoom - 0.1))}
                   theme={theme}

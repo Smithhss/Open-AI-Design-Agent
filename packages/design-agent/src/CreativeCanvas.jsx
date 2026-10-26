@@ -1,5 +1,6 @@
 "use client";
 
+import { canvasText } from "./canvasLocale.mjs";
 import React, { useState, useEffect, useRef, useCallback, Suspense, useMemo } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import axios from "axios";
@@ -50,15 +51,15 @@ const formatTime = (dateStr) => {
   return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 };
 
-const formatDateHeader = (dateStr) => {
+const formatDateHeader = (dateStr, locale) => {
   if (!dateStr) return "";
   const d = new Date(dateStr);
   const now = new Date();
-  if (d.toDateString() === now.toDateString()) return "Today";
+  if (d.toDateString() === now.toDateString()) return canvasText(locale, "Today");
   const yesterday = new Date(now);
   yesterday.setDate(now.getDate() - 1);
-  if (d.toDateString() === yesterday.toDateString()) return "Yesterday";
-  return d.toLocaleDateString([], { weekday: 'long', month: 'short', day: 'numeric' });
+  if (d.toDateString() === yesterday.toDateString()) return canvasText(locale, "Yesterday");
+  return d.toLocaleDateString(locale === "zh" ? "zh-CN" : "en-US", { weekday: 'long', month: 'short', day: 'numeric' });
 };
 
 const TypingDots = () => (
@@ -71,6 +72,7 @@ const TypingDots = () => (
 
 export default function CreativeCanvas({
   user,
+  locale = "en",
   theme: forcedTheme,
   setTheme: forcedSetTheme,
   creditConversionRate = 200,
@@ -106,18 +108,40 @@ export default function CreativeCanvas({
   resolveAsset = null,
   // fyt 票据：直接注入请求头，不依赖 localStorage（避免令牌被覆盖或时序问题）
   fytTicket = null,
+  fytTicketExpiresAt = 0,
+  fytUserId = null,
 }) {
+  const t = text => canvasText(locale, text);
   const router = useRouter();
   const searchParams = useSearchParams();
   const inEmbedMode = isEmbed && !!embedCode;
-  const embedStorageKey = inEmbedMode ? `muapi_agent_session_${embedCode}` : null;
+  const scopedSession = inEmbedMode || localCanvas;
+  const embedStorageKey = localCanvas
+    ? (fytUserId ? `fyt_canvas_session_${fytUserId}` : null)
+    : inEmbedMode ? `muapi_agent_session_${embedCode}` : null;
   const notifiedGenerationEventsRef = useRef(new Set());
   const generationActivityEventIdsRef = useRef(new Set());
   const [embedSessionId, setEmbedSessionId] = useState(() => {
     if (typeof window === "undefined" || !embedStorageKey) return null;
     return window.localStorage.getItem(embedStorageKey) || null;
   });
-  const sessionId = inEmbedMode ? embedSessionId : searchParams.get("session");
+  const sessionId = scopedSession ? embedSessionId : searchParams.get("session");
+  const credentialsRef = useRef({ fytTicket, fytTicketExpiresAt, fytUserId });
+  credentialsRef.current = { fytTicket, fytTicketExpiresAt, fytUserId };
+  const requests = useRef(new AbortController());
+  const agentClient = useMemo(() => {
+    const client = axios.create();
+    client.interceptors.request.use(config => ({
+      ...config,
+      signal: requests.current.signal,
+      ...(localCanvas ? { headers: { ...config.headers, ...getHeaders() } } : {}),
+    }));
+    return client;
+  }, []);
+  useEffect(() => {
+    requests.current = new AbortController();
+    return () => { requests.current.abort(); };
+  }, []);
 
   const [input, setInput] = useState("");
   const [messages, setMessages] = useState([]);
@@ -186,12 +210,17 @@ export default function CreativeCanvas({
     if (inEmbedMode) {
       return { "x-agent-embed-code": embedCode };
     }
-    if (fytTicket) return { Authorization: `Bearer ${fytTicket}` };
+    if (requests.current.signal.aborted) throw new Error("Canvas closed");
+    if (localCanvas) {
+      const current = credentialsRef.current;
+      if (!current.fytTicket || !current.fytUserId || current.fytTicketExpiresAt <= Date.now()) throw new Error("Authentication required");
+      return { Authorization: `Bearer ${current.fytTicket}` };
+    }
     const token = typeof window !== "undefined" ? localStorage.getItem("token") : null;
     return token ? { Authorization: `Bearer ${token}` } : {};
-  }, [inEmbedMode, embedCode, fytTicket]);
+  }, [inEmbedMode, embedCode, localCanvas]);
 
-  // Persist embed session_id across page reloads so the conversation resumes.
+  // FYT sessions persist per Go user; legacy URL session IDs never cross accounts.
   const setActiveEmbedSession = useCallback((id) => {
     setEmbedSessionId(id);
     if (typeof window !== "undefined" && embedStorageKey) {
@@ -207,15 +236,16 @@ export default function CreativeCanvas({
     // visitor only ever sees the one keyed by their localStorage. Skip the
     // sessions list fetch (which would also 403-on-allowed-origins or surface
     // sessions from other embeds spawned by the same owner).
+    if (localCanvas && !fytTicket) return;
     if (!inEmbedMode) fetchSessions();
     fetchSkills();
-  }, []);
+  }, [localCanvas && Boolean(fytTicket)]);
 
   // Handle initial query and skill from URL (Fallback only)
   useEffect(() => {
     if (!mounted || busy || initialHandoffProcessed.current) return;
     // Embed pages never have a / handoff URL — skip.
-    if (inEmbedMode) {
+    if (inEmbedMode || localCanvas) {
       initialHandoffProcessed.current = true;
       return;
     }
@@ -291,15 +321,15 @@ export default function CreativeCanvas({
         fetchSessions(); // Re-fetch to find the name if not in list
       }
     } else {
-      setMessages([{ role: "assistant", content: `Hello ${user?.username || "User"} — what shall we create today?`, timestamp: new Date().toISOString() }]);
+      setMessages([{ role: "assistant", content: locale === "zh" ? `你好，${user?.username || "用户"}，今天想创作什么？` : `Hello ${user?.username || "User"} — what shall we create today?`, timestamp: new Date().toISOString() }]);
       setAssets([]);
-      setCurrentSessionName("New Session");
+      setCurrentSessionName(t("New Session"));
     }
-  }, [sessionId]); // Removed sessions from deps to avoid infinite loop if fetchSessions updates sessions
+  }, [sessionId, localCanvas && Boolean(fytTicket)]); // Removed sessions from deps to avoid infinite loop if fetchSessions updates sessions
 
   const fetchSessions = async () => {
     try {
-      const { data } = await axios.get(`${API}/sessions`, { headers: getHeaders() });
+      const { data } = await agentClient.get(`${API}/sessions`, { headers: getHeaders() });
       setSessions(data);
       if (sessionId) {
         const current = data.find(s => s.id === sessionId);
@@ -310,7 +340,7 @@ export default function CreativeCanvas({
 
   const fetchSkills = async () => {
     try {
-      const { data } = await axios.get(`${API}/agent-skills`, { headers: getHeaders() });
+      const { data } = await agentClient.get(`${API}/agent-skills`, { headers: getHeaders() });
       setSkills(data);
     } catch (err) {
       console.error("Failed to fetch skills:", err);
@@ -545,9 +575,9 @@ export default function CreativeCanvas({
     let lastProgress = Date.now();
     
     setBusy(true);
-    while (true) {
+    while (!requests.current.signal.aborted) {
       try {
-        const { data } = await axios.get(`${API}/jobs/${jobId}/events`, {
+        const { data } = await agentClient.get(`${API}/jobs/${jobId}/events`, {
           params: { since: cursor },
           headers: getHeaders(),
         });
@@ -559,23 +589,26 @@ export default function CreativeCanvas({
         if (data.done) break;
         if (Date.now() - lastProgress > MAX_DEAD_AIR) throw new Error("Stalled");
       } catch (err) {
-        if (Date.now() - lastProgress > MAX_DEAD_AIR) break;
+        if (requests.current.signal.aborted || Date.now() - lastProgress > MAX_DEAD_AIR) break;
       }
       await new Promise(r => setTimeout(r, POLL_INTERVAL));
     }
+    if (requests.current.signal.aborted) return;
     setBusy(false);
     loadAssets();
-    // Persist final state
+    // Credentials may expire while the last poll finishes.
+    let headers;
+    try { headers = getHeaders(); } catch { return; }
     setMessages(prev => {
       const next = [...prev];
-      axios.patch(`${API}/sessions/${sessionId}/messages`, { messages: next }, { headers: getHeaders() }).catch(() => {});
+      agentClient.patch(`${API}/sessions/${sessionId}/messages`, { messages: next }, { headers }).catch(() => {});
       return next;
     });
   };
 
   const handleJobAction = async (jobId, action) => {
     try {
-      await axios.post(`${API}/jobs/${jobId}/${action}`, {}, { headers: getHeaders() });
+      await agentClient.post(`${API}/jobs/${jobId}/${action}`, {}, { headers: getHeaders() });
       toast.success(`Job ${action}ed`);
       
       // Hide the approval card in the UI
@@ -597,7 +630,7 @@ export default function CreativeCanvas({
 
   const loadHistory = async () => {
     try {
-      const { data } = await axios.get(`${API}/sessions/${sessionId}/messages`, { headers: getHeaders() });
+      const { data } = await agentClient.get(`${API}/sessions/${sessionId}/messages`, { headers: getHeaders() });
       if (data && data.length > 0) {
         // Cleanup: Hide approval cards that already have results or are for inactive jobs
         const cleaned = data.map(m => ({
@@ -617,7 +650,9 @@ export default function CreativeCanvas({
       } else {
         setMessages([{ role: "assistant", content: `Session ready — what shall we create?`, timestamp: new Date().toISOString() }]);
       }
-    } catch {
+    } catch (error) {
+      if (localCanvas && error.response?.status === 404) setActiveEmbedSession(null);
+      if (requests.current.signal.aborted) return;
       setMessages([{ role: "assistant", content: `Session ready — what shall we create?`, timestamp: new Date().toISOString() }]);
     }
   };
@@ -625,7 +660,7 @@ export default function CreativeCanvas({
   const checkActiveJobs = async (currentMessages) => {
     if (!sessionId) return;
     try {
-      const { data } = await axios.get(`${API}/sessions/${sessionId}/jobs`, { headers: getHeaders() });
+      const { data } = await agentClient.get(`${API}/sessions/${sessionId}/jobs`, { headers: getHeaders() });
       const active = data.find(j => (j.status === "pending" || j.status === "processing") && j.id);
       if (active) {
         // If the last message is assistant but empty/no events, it might be the one for this job.
@@ -647,7 +682,7 @@ export default function CreativeCanvas({
   const loadAssets = async () => {
     if (!sessionId) return;
     try {
-      const { data } = await axios.get(`${API}/sessions/${sessionId}/assets`, { headers: getHeaders() });
+      const { data } = await agentClient.get(`${API}/sessions/${sessionId}/assets`, { headers: getHeaders() });
       setAssets(data);
     } catch {}
   };
@@ -658,9 +693,9 @@ export default function CreativeCanvas({
   
   const ensureSession = async () => {
     if (sessionId) return sessionId;
-    const { data } = await axios.post(`${API}/sessions`, {}, { headers: getHeaders() });
+    const { data } = await agentClient.post(`${API}/sessions`, {}, { headers: getHeaders() });
     justCreatedSessionRef.current = true;
-    if (inEmbedMode) {
+    if (scopedSession) {
       setActiveEmbedSession(data.id);
     } else {
       router.replace(`?session=${data.id}`, { scroll: false });
@@ -671,6 +706,10 @@ export default function CreativeCanvas({
 
   const processFile = async (file) => {
     if (!file) return;
+    if (localCanvas) {
+      await onLocalFiles?.([file]);
+      return;
+    }
 
     setUploading(true);
     setUploadProgress(0);
@@ -680,7 +719,7 @@ export default function CreativeCanvas({
       const activeSessionId = await ensureSession();
 
       // 1. Get signed URL
-      const { data: signData } = await axios.get("/api/v1/get_upload_url", {
+      const { data: signData } = await agentClient.get("/api/v1/get_upload_url", {
         params: { filename: file.name },
         headers: getHeaders()
       });
@@ -696,7 +735,7 @@ export default function CreativeCanvas({
       formData.append("file", file);
 
       // 2. Upload via local proxy
-      await axios.post("/api/v1/upload-binary", formData, {
+      await agentClient.post("/api/v1/upload-binary", formData, {
         headers: { "Content-Type": "multipart/form-data" },
         onUploadProgress: (pe) => {
           setUploadProgress(Math.round((pe.loaded * 100) / pe.total));
@@ -710,7 +749,7 @@ export default function CreativeCanvas({
       const kind = file.type?.startsWith("video/") ? "video"
                  : file.type?.startsWith("audio/") ? "audio"
                  : "image";
-      const { data: registered } = await axios.post(
+      const { data: registered } = await agentClient.post(
         `${API}/sessions/${activeSessionId}/assets`,
         { url: uploadedUrl, kind, source_tool: "upload" },
         { headers: getHeaders() },
@@ -726,7 +765,7 @@ export default function CreativeCanvas({
       toast.success(`Uploaded as ${registered.asset_label}`);
     } catch (err) {
       console.error("Upload failed", err);
-      toast.error("Upload failed");
+      toast.error(t("Upload failed"));
     } finally {
       setUploading(false);
       setUploadProgress(0);
@@ -766,6 +805,13 @@ export default function CreativeCanvas({
     const currentAttachments = attachmentsOverride || attachments;
     if ((!typed && currentAttachments.length === 0) || busy) return;
     
+    let canvasState = null;
+    try { canvasState = canvasRef.current?.getCanvasState?.() || null; } catch {}
+    if (localCanvas && !canvasState) { toast.error(t("Canvas is not ready")); return; }
+    if (canvasState?.selected_unregistered_image) {
+      toast.error(t("Local image editing is not connected yet. Deselect the image to generate a new one."));
+      return;
+    }
     const currentSkill = skillOverride || activeSkill;
 
     
@@ -773,7 +819,7 @@ export default function CreativeCanvas({
     try {
       activeSessionId = await ensureSession();
     } catch (err) {
-      toast.error("Failed to establish session");
+      toast.error(t("Failed to establish session"));
       return;
     }
 
@@ -804,11 +850,6 @@ export default function CreativeCanvas({
     const aIdx = updatedMessages.length; 
     
     try {
-      let canvasState = null;
-      try {
-        canvasState = canvasRef.current?.getCanvasState?.() || null;
-      } catch {}
-
       let endpoint = `${API}/sessions/${activeSessionId}/chat`;
       let payload = {
         message: typed,
@@ -831,7 +872,7 @@ export default function CreativeCanvas({
         if (!skillOverride) setActiveSkill(null); // Clear skill after sending if not override
       }
 
-      const enqueueRes = await axios.post(endpoint, payload, { headers: getHeaders() });
+      const enqueueRes = await agentClient.post(endpoint, payload, { headers: getHeaders() });
       await resumePolling(enqueueRes.data.job_id, aIdx);
     } catch (err) {
       setMessages(prev => {
@@ -840,12 +881,15 @@ export default function CreativeCanvas({
         return arr;
       });
     } finally {
+      if (requests.current.signal.aborted) return;
       setBusy(false);
       await loadAssets();
       if (activeSessionId) {
+        let headers;
+        try { headers = getHeaders(); } catch { return; }
         setMessages(prev => {
           const newMsgs = [...prev];
-          axios.patch(`${API}/sessions/${activeSessionId}/messages`, { messages: newMsgs }, { headers: getHeaders() }).catch(() => {});
+          agentClient.patch(`${API}/sessions/${activeSessionId}/messages`, { messages: newMsgs }, { headers }).catch(() => {});
           return newMsgs;
         });
       }
@@ -951,14 +995,14 @@ export default function CreativeCanvas({
       return;
     }
     try {
-      await axios.patch(`${API}/sessions/${targetId}`, { name: targetName.trim() }, { headers: getHeaders() });
+      await agentClient.patch(`${API}/sessions/${targetId}`, { name: targetName.trim() }, { headers: getHeaders() });
       if (targetId === sessionId) setCurrentSessionName(targetName.trim());
       setIsEditingName(false);
       setEditingSessionId(null);
       fetchSessions();
-      toast.success("Session renamed");
+      toast.success(t("Session renamed"));
     } catch {
-      toast.error("Failed to rename session");
+      toast.error(t("Failed to rename session"));
       setIsEditingName(false);
       setEditingSessionId(null);
     }
@@ -967,11 +1011,12 @@ export default function CreativeCanvas({
   const deleteSession = async (id) => {
     // We use a simple confirm for safety, but with a premium look via toast if we had a custom one.
     // For now, standard confirm is reliable.
-    if (!window.confirm("Are you sure you want to delete this session?")) return;
+    if (!window.confirm(t("Are you sure you want to delete this session?"))) return;
     try {
-      await axios.delete(`${API}/sessions/${id}`, { headers: getHeaders() });
-      toast.success("Session deleted");
-      if (inEmbedMode) {
+      await agentClient.delete(`${API}/sessions/${id}`, { headers: getHeaders() });
+      toast.success(t("Session deleted"));
+      if (scopedSession) {
+        fetchSessions();
         if (id === sessionId) setActiveEmbedSession(null);
       } else {
         fetchSessions();
@@ -980,7 +1025,7 @@ export default function CreativeCanvas({
         }
       }
     } catch (err) {
-      toast.error("Failed to delete session");
+      toast.error(t("Failed to delete session"));
     }
   };
 
@@ -1030,7 +1075,7 @@ export default function CreativeCanvas({
     try {
       if (navigator.clipboard && window.isSecureContext) {
         await navigator.clipboard.writeText(text);
-        toast.success("Copied to clipboard");
+        toast.success(t("Copied to clipboard"));
       } else {
         const textArea = document.createElement("textarea");
         textArea.value = text;
@@ -1038,14 +1083,14 @@ export default function CreativeCanvas({
         textArea.select();
         try {
           document.execCommand('copy');
-          toast.success("Copied to clipboard");
+          toast.success(t("Copied to clipboard"));
         } catch (err) {
-          toast.error("Failed to copy");
+          toast.error(t("Failed to copy"));
         }
         document.body.removeChild(textArea);
       }
     } catch (err) {
-      toast.error("Failed to copy");
+      toast.error(t("Failed to copy"));
     }
   };
 
@@ -1069,29 +1114,29 @@ export default function CreativeCanvas({
               <Link 
                 href="/"
                 className={`p-2 hover:bg-bg-page rounded text-secondary-text hover:text-primary transition-colors`}
-                title="Go Back"
+                title={t("Go Back")}
               >
                 <FiArrowLeft size={16} />
               </Link>
               <Link
                 href="/"
                 className="flex items-center flex-shrink-0 transition-transform duration-300 hover:scale-[1.02] active:scale-95"
-                aria-label="Home"
+                aria-label={t("Home")}
               >
-                <span className="font-bold text-lg">Design Agent Studio</span>
+                <span className="font-bold text-lg">{t("Design Agent Studio")}</span>
               </Link>
             </div>
             <button 
               onClick={() => setShowLeftSidebar(!showLeftSidebar)}
               className={`p-1.5 rounded transition-colors ${showLeftSidebar ? "bg-primary/10 text-primary" : "hover:bg-bg-card text-secondary-text hover:text-primary"}`}
-              title="Toggle Sessions"
+              title={t("Toggle Sessions")}
             >
               <VscLayoutSidebarLeftOff size={16} />
             </button>
           </div>
           <div className="flex-1 overflow-y-auto scrollbar-subtle">
             {sessions.length === 0 ? (
-              <div className="px-4 py-8 text-center text-secondary-text italic text-[11px]">No previous sessions</div>
+              <div className="px-4 py-8 text-center text-secondary-text italic text-[11px]">{t("No previous sessions")}</div>
             ) : (
               sessions.map((s) => (
                 <div
@@ -1100,7 +1145,7 @@ export default function CreativeCanvas({
                   onMouseLeave={() => setHoveredSessionId(null)}
                   className={`relative w-full flex items-center gap-3 px-4 py-3.5 cursor-pointer transition-all border-l-2 group
                     ${sessionId === s.id ? "border-primary bg-primary/5" : "border-transparent hover:bg-bg-card-hover"}`}
-                  onClick={() => {router.push(`?session=${s.id}`); setShowLeftSidebar(!showLeftSidebar);}}
+                  onClick={() => { if (scopedSession) setActiveEmbedSession(s.id); else router.push(`?session=${s.id}`); setShowLeftSidebar(!showLeftSidebar); }}
                 >
                   <div className="flex-1 min-w-0 pr-12">
                     {editingSessionId === s.id ? (
@@ -1136,7 +1181,7 @@ export default function CreativeCanvas({
                           setEditingSessionName(s.name);
                         }}
                         className="p-1.5 hover:bg-bg-page rounded text-secondary-text hover:text-primary transition-colors"
-                        title="Rename"
+                        title={t("Rename")}
                       >
                         <FiEdit2 size={13} />
                       </button>
@@ -1146,7 +1191,7 @@ export default function CreativeCanvas({
                           deleteSession(s.id);
                         }}
                         className="p-1.5 hover:bg-red-500/10 rounded text-secondary-text hover:text-red-500 transition-colors"
-                        title="Delete"
+                        title={t("Delete")}
                       >
                         <HiOutlineTrash size={14} />
                       </button>
@@ -1158,7 +1203,7 @@ export default function CreativeCanvas({
           </div>
           <div className="p-3 border-t border-divider bg-bg-page/30">
             <div className="flex items-center justify-between text-[10px] text-secondary-text font-medium px-1">
-              <span>Total Sessions</span>
+              <span>{t("Total Sessions")}</span>
               <span>{sessions.length}</span>
             </div>
           </div>
@@ -1171,7 +1216,7 @@ export default function CreativeCanvas({
                 <button
                   onClick={() => setShowLeftSidebar(!showLeftSidebar)}
                   className={`p-2 hover:bg-bg-card rounded transition-colors ${showLeftSidebar ? "text-primary" : "hidden"}`}
-                  title="Toggle Sessions"
+                  title={t("Toggle Sessions")}
                 >
                   <VscLayoutSidebarLeftOff size={18} />
                 </button>
@@ -1181,7 +1226,7 @@ export default function CreativeCanvas({
                 <Link
                   href="/"
                   className={`p-1.5 hover:bg-bg-card rounded text-secondary-text hover:text-primary transition-colors ${!showLeftSidebar && "hidden"}`}
-                  title="Go Back"
+                  title={t("Go Back")}
                 >
                   <FiArrowLeft size={16} />
                 </Link>
@@ -1191,7 +1236,7 @@ export default function CreativeCanvas({
                 <button
                   onClick={() => setActiveEmbedSession(null)}
                   className="p-1.5 hover:bg-bg-card rounded text-secondary-text hover:text-primary transition-colors"
-                  title="New chat"
+                  title={t("New chat")}
                 >
                   <FiPlus size={16} />
                 </button>
@@ -1211,7 +1256,7 @@ export default function CreativeCanvas({
                     suppressHydrationWarning
                     className="font-bold text-xs flex items-center text-primary-text truncate"
                   >
-                    {userBalanceLabel ?? `$ ${user?.balance || "0.00"}`}
+                    {(localCanvas ? t("Managed by FYT") : userBalanceLabel ?? `$ ${user?.balance || "0.00"}`)}
                   </span>
                 </div>
               )}
@@ -1241,7 +1286,7 @@ export default function CreativeCanvas({
                   <button
                     onClick={handleToggleSidebar}
                     className="w-8 h-8 rounded-full rotate-270 hover:bg-bg-page hover:text-primary-text transition-all flex items-center justify-center text-secondary-text z-[60]"
-                    title="Open Chat"
+                    title={t("Open Chat")}
                   >
                     <HiOutlineArrowUpTray size={18} />
                   </button>
@@ -1263,7 +1308,7 @@ export default function CreativeCanvas({
                         </span>
                       ) : (
                         <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-orange-500/10 text-orange-500 border border-orange-500 uppercase tracking-wider">
-                          Bronze
+                          {t("Bronze")}
                         </span>
                       )}
                     </div>
@@ -1271,7 +1316,7 @@ export default function CreativeCanvas({
                       {user?.email}
                     </span>
                     <div className="mt-2 text-[13px] font-bold text-primary">
-                      {userBalanceLabel ?? `$ ${user?.balance || "0.00"}`} <span className="font-normal text-secondary-text">available</span>
+                      {(localCanvas ? t("Managed by FYT") : userBalanceLabel ?? `$ ${user?.balance || "0.00"}`)} <span className="font-normal text-secondary-text">{t("available")}</span>
                     </div>
                   </div>
                   
@@ -1280,7 +1325,7 @@ export default function CreativeCanvas({
                       href="mailto:support@vadoo.tv"
                       className="w-full flex items-center gap-3 px-4 py-2 hover:bg-bg-page transition-colors text-[13px] font-semibold text-primary-text"
                     >
-                      Support
+                      {t("Support")}
                     </a>
                   </div>
                   <div className="h-px bg-divider w-full my-1" />
@@ -1296,7 +1341,7 @@ export default function CreativeCanvas({
                         <span className="text-secondary-text">
                           {resolvedTheme === "dark" ? <FiSun size={15} /> : <FiMoon size={15} />}
                         </span>
-                        Dark Mode
+                        {t("Dark Mode")}
                       </div>
                       <div className={`w-8 h-4 rounded-full relative transition-colors ${resolvedTheme === "dark" ? "bg-primary" : "bg-bg-card-hover"}`}>
                         <div className={`absolute top-0.5 w-3 h-3 rounded-full bg-black dark:bg-white transition-all ${resolvedTheme === "dark" ? "left-4.5" : "left-0.5"}`} />
@@ -1311,6 +1356,7 @@ export default function CreativeCanvas({
           {/* Main Canvas View */}
           <div className="flex-1 relative overflow-hidden bg-bg-page/50 w-full">
             <CanvasArea 
+              locale={locale}
               ref={node => { canvasRef.current = node; if (canvasApiRef) canvasApiRef.current = node; }}
               theme={resolvedTheme}
               activeTasks={activeTasks}
@@ -1360,27 +1406,27 @@ export default function CreativeCanvas({
           <div className="p-4 flex items-center justify-between border-b border-divider bg-bg-card">
             <div className="flex flex-col">
               <h2 className="font-bold text-[13px] text-primary-text uppercase tracking-widest leading-none flex items-center gap-2">
-                <RiSparklingLine className="text-primary" /> Creative Agent
+                <RiSparklingLine className="text-primary" /> {t("Creative Agent")}
               </h2>
-              <span className="text-[10px] text-secondary-text mt-1.5">Auto Model • Multi-tool Access</span>
+              <span className="text-[10px] text-secondary-text mt-1.5">{t("Auto Model \u2022 Multi-tool Access")}</span>
             </div>
             <div className="flex items-center gap-1">
               <Link 
                 href="https://muapi.ai/docs/design-agent-api" 
                 target="_blank"
                 className="p-1.5 hover:bg-bg-page hover:text-primary-text transition-colors rounded text-secondary-text"
-                title="API Docs"
+                title={t("API Docs")}
               >
                 <CgTerminal size={16} />
               </Link>
               {sessionId && (
                 <button
                   onClick={() => {
-                    if (inEmbedMode) setActiveEmbedSession(null);
+                    if (scopedSession) setActiveEmbedSession(null);
                     else router.push("/canvas");
                   }}
                   className="p-1.5 hover:bg-bg-page hover:text-primary-text transition-colors rounded text-secondary-text"
-                  title="New Session"
+                  title={t("New Session")}
                 >
                   <FiPlus size={16} />
                 </button>
@@ -1388,7 +1434,7 @@ export default function CreativeCanvas({
               <button
                 onClick={handleToggleSidebar}
                 className={`w-8 h-8 rounded-full transition-all flex items-center justify-center shrink-0 ${showChat ? "bg-primary/10 text-primary" : "hover:bg-bg-page text-secondary-text hover:text-primary"}`}
-                title={showChat ? "Hide Chat" : "Open Chat"}
+                title={t(showChat ? "Hide Chat" : "Open Chat")}
               >
                 <FiLayout size={16} />
               </button>
@@ -1410,7 +1456,7 @@ export default function CreativeCanvas({
                   {showDateHeader && msg.timestamp && (
                     <div className="flex justify-center my-4">
                       <span className="px-2 py-1 bg-bg-page border border-divider rounded text-[10px] font-medium text-secondary-text shadow-sm">
-                        {formatDateHeader(msg.timestamp)}
+                        {formatDateHeader(msg.timestamp, locale)}
                       </span>
                     </div>
                   )}
@@ -1418,7 +1464,7 @@ export default function CreativeCanvas({
                     <div className="flex items-center gap-2">
                       {msg.role === "assistant" && (
                         <div className="flex items-center gap-1.5 text-[10px] font-medium text-secondary-text ml-1">
-                          <RiRobot2Line /> Agent
+                          <RiRobot2Line /> {t("Agent")}
                         </div>
                       )}
                       <div className={`flex items-center justify-end gap-2 text-[9px] text-secondary-text`}>
@@ -1486,7 +1532,7 @@ export default function CreativeCanvas({
                           )}
                           
                           {(msg.events || []).filter(e => e && ["tool_call", "tool_result", "plan_propose", "error", "info"].includes(e.type)).map((ev, i) => (
-                            <EventPill key={i} event={{...ev, onAction: handleJobAction}} />
+                            <EventPill locale={locale} key={i} event={{...ev, onAction: handleJobAction}} />
                           ))}
                         </div>
 
@@ -1495,7 +1541,7 @@ export default function CreativeCanvas({
                           onClick={() => copyToClipboard(msg.content)}
                           className={`absolute top-0 opacity-0 group-hover:opacity-100 transition-opacity p-1.5 rounded bg-bg-card border border-divider shadow-md hover:text-primary z-10
                             ${msg.role === "user" ? "right-full mr-2" : "left-full ml-2"}`}
-                          title="Copy Message"
+                          title={t("Copy Message")}
                         >
                           <FiCopy size={12} />
                         </button>
@@ -1545,7 +1591,7 @@ export default function CreativeCanvas({
                     </div>
                     <div className="max-h-60 overflow-y-auto scrollbar-subtle py-1">
                       {filteredAssets.length > 0 && (
-                        <div className="px-3 py-1.5 mt-1 text-[9px] font-bold text-green-500 uppercase opacity-60">Assets</div>
+                        <div className="px-3 py-1.5 mt-1 text-[9px] font-bold text-green-500 uppercase opacity-60">{t("Assets")}</div>
                       )}
                       <div className="grid grid-cols-2 gap-2">
                         {filteredAssets.map(asset => (
@@ -1556,7 +1602,7 @@ export default function CreativeCanvas({
                           >
                             {asset.kind === "image" && <img src={asset.url} className="w-7 h-7 rounded border border-divider object-cover shadow-sm" />}
                             {asset.kind === "video" && <video src={asset.url} className="w-7 h-7 rounded border border-divider object-cover shadow-sm" />}
-                            {asset.kind === "audio" && <div className="w-7 h-7 rounded flex items-center justify-center bg-primary/5 text-primary text-[8px] font-bold uppercase tracking-tight">Audio</div>}
+                            {asset.kind === "audio" && <div className="w-7 h-7 rounded flex items-center justify-center bg-primary/5 text-primary text-[8px] font-bold uppercase tracking-tight">{t("Audio")}</div>}
                             <div className="flex flex-col">
                               <span className="text-xs font-medium text-primary-text">{asset.asset_label}</span>
                               <span className="text-[9px] text-secondary-text truncate max-w-[200px]">{asset.kind}</span>
@@ -1565,7 +1611,7 @@ export default function CreativeCanvas({
                         ))}
                       </div>
                       {filteredSkills.length > 0 && (
-                        <div className="px-3 py-1.5 text-[9px] font-bold text-primary uppercase opacity-60">Skills</div>
+                        <div className="px-3 py-1.5 text-[9px] font-bold text-primary uppercase opacity-60">{t("Skills")}</div>
                       )}
                       {filteredSkills.map(skill => (
                         <button
@@ -1578,7 +1624,7 @@ export default function CreativeCanvas({
                         </button>
                       ))}                      
                       {filteredSkills.length === 0 && filteredAssets.length === 0 && (
-                        <div className="px-4 py-8 text-center text-secondary-text text-xs italic opacity-50">No matches found</div>
+                        <div className="px-4 py-8 text-center text-secondary-text text-xs italic opacity-50">{t("No matches found")}</div>
                       )}
                     </div>
                   </div>
@@ -1610,7 +1656,7 @@ export default function CreativeCanvas({
                 }}
                 onKeyDown={handleKey}
                 onInput={e => { e.target.style.height = "auto"; e.target.style.height = Math.min(e.target.scrollHeight, 120) + "px"; }}
-                placeholder={activeSkill ? `Oh, Let us create ${activeSkill.name.toLowerCase()}s, start with your ${activeSkill.inputs?.[0]?.replace(/_/g, ' ') || 'idea'}?` : "Start with an idea or mention assets using @..."}
+                placeholder={locale === "zh" ? "描述你的想法，或使用 @ 引用素材…" : activeSkill ? `Oh, Let us create ${activeSkill.name.toLowerCase()}s, start with your ${activeSkill.inputs?.[0]?.replace(/_/g, ' ') || 'idea'}?` : "Start with an idea or mention assets using @..."}
                 className="w-full bg-transparent px-3 py-3 text-[13px] resize-none focus:outline-none min-h-[50px] max-h-[120px] scrollbar-subtle"
                 rows={1}
                 disabled={busy}
@@ -1698,7 +1744,7 @@ export default function CreativeCanvas({
                     onClick={() => fileInputRef.current?.click()}
                     disabled={uploading}
                     className="p-1.5 rounded hover:bg-bg-page text-secondary-text transition-all"
-                    title="Upload Image"
+                    title={t("Upload Image")}
                   >
                     <FiUpload size={16} />
                   </button>
@@ -1717,7 +1763,7 @@ export default function CreativeCanvas({
                       onClick={() => setShowSkillsMenu(!showSkillsMenu)}
                       className={`p-1.5 rounded hover:bg-bg-page transition-all flex items-center gap-1.5
                         ${showSkillsMenu ? "bg-bg-page text-primary shadow-inner" : "text-secondary-text"}`}
-                      title="Agent Skills"
+                      title={t("Agent Skills")}
                     >
                       <GoBook size={16} />
                     </button>
@@ -1726,7 +1772,7 @@ export default function CreativeCanvas({
                       <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-3 w-[320px] bg-bg-card border border-divider rounded shadow-2xl z-50 overflow-hidden animate-in fade-in slide-in-from-bottom-2 duration-200">
                         <div className="px-4 py-3 border-b border-divider flex items-center justify-between bg-bg-page/30">
                           <div>
-                            <h3 className="text-[12px] font-bold text-primary-text uppercase tracking-tight">Expert Skills</h3>
+                            <h3 className="text-[12px] font-bold text-primary-text uppercase tracking-tight">{t("Expert Skills")}</h3>
                           </div>
                           <Link 
                             href="https://muapi.ai/docs/design-agent-api"
@@ -1734,7 +1780,7 @@ export default function CreativeCanvas({
                             className="text-[10px] font-bold text-primary hover:underline flex items-center gap-1"
                           >
                             <CgTerminal size={10} />
-                            API Docs
+                            {t("API Docs")}
                           </Link>
                         </div>
                         <div className="max-h-80 overflow-y-auto p-1.5 scrollbar-subtle">
@@ -1765,7 +1811,7 @@ export default function CreativeCanvas({
                             onClick={() => setShowSkillsMenu(false)}
                             className="text-[10px] font-bold text-secondary-text hover:text-primary-text transition-colors"
                           >
-                            Dismiss
+                            {t("Dismiss")}
                           </button>
                         </div>
                       </div>
@@ -1786,7 +1832,7 @@ export default function CreativeCanvas({
                       onClick={() => setShowAssetsMenu(!showAssetsMenu)}
                       className={`p-1.5 rounded hover:bg-bg-page transition-all flex items-center gap-1.5
                         ${showAssetsMenu ? "bg-bg-page text-primary shadow-inner" : "text-secondary-text"}`}
-                      title="Session Assets"
+                      title={t("Session Assets")}
                     >
                       <FiImage size={16} />
                     </button>
@@ -1794,12 +1840,12 @@ export default function CreativeCanvas({
                     {showAssetsMenu && (
                       <div className="absolute bottom-full right-0 mb-2 w-72 bg-bg-card border border-divider rounded shadow-2xl z-30 animate-fade-in-up">
                         <div className="p-2 mb-2 border-b border-divider text-[10px] font-bold text-secondary-text flex items-center justify-between">
-                          <span>Session Assets</span>
+                          <span>{t("Session Assets")}</span>
                           <span className="opacity-50">{assets.length} items</span>
                         </div>
                         <div className="max-h-80 overflow-y-auto scrollbar-subtle p-2 grid grid-cols-3 gap-2">
                           {assets.length === 0 ? (
-                            <div className="col-span-3 py-8 text-center text-secondary-text text-[10px] italic">No assets generated yet</div>
+                            <div className="col-span-3 py-8 text-center text-secondary-text text-[10px] italic">{t("No assets generated yet")}</div>
                           ) : (
                             assets.map((asset, i) => (
                               <div 
@@ -1814,7 +1860,7 @@ export default function CreativeCanvas({
                               >
                                 {asset.kind === "image" && <img src={asset.url} className="w-full h-full object-cover" />}
                                 {asset.kind === "video" && <video src={asset.url} className="w-full h-full object-cover" />}
-                                {asset.kind === "audio" && <div className="w-full h-full flex items-center justify-center bg-primary/5 text-primary text-[8px] font-bold uppercase tracking-tight">Audio</div>}
+                                {asset.kind === "audio" && <div className="w-full h-full flex items-center justify-center bg-primary/5 text-primary text-[8px] font-bold uppercase tracking-tight">{t("Audio")}</div>}
                                 
                                 <div className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 transition-opacity flex flex-col items-center justify-center p-1 text-center">
                                   <span className="text-[10px] text-white font-bold truncate w-full mb-1">{asset.asset_label}</span>
@@ -1860,7 +1906,8 @@ const TOOL_ICONS = {
   propose_plan: "📋", list_assets: "📁", get_asset: "🔍", remaining_budget: "💰",
 };
 
-function EventPill({ event }) {
+function EventPill({ event, locale = "en" }) {
+  const t = text => canvasText(locale, text);
   if (event.type === "tool_call") return (
     <div className="flex items-center gap-1.5 px-2.5 py-1.5 rounded bg-primary/10 border border-primary text-primary text-[11px] mt-1 shadow-sm">
       <span>{TOOL_ICONS[event.name] || "🔧"}</span>
@@ -1883,7 +1930,7 @@ function EventPill({ event }) {
               ))}
             </div>
           )}
-          <div className="text-[10px] text-secondary-text mt-1.5 italic">Reply to continue.</div>
+          <div className="text-[10px] text-secondary-text mt-1.5 italic">{t("Reply to continue.")}</div>
         </div>
       );
     }
@@ -1925,13 +1972,13 @@ function EventPill({ event }) {
           onClick={() => event.onAction?.(event.job_id, "approve")}
           className="flex-1 py-2 rounded bg-primary text-white text-[12px] font-bold hover:brightness-110 transition-all flex items-center justify-center gap-2"
         >
-          <FiCheck /> Approve & Execute
+          <FiCheck /> {t("Approve & Execute")}
         </button>
         <button 
           onClick={() => event.onAction?.(event.job_id, "reject")}
           className="px-4 py-2 rounded bg-bg-card border border-divider text-secondary-text text-[12px] hover:bg-bg-page transition-all"
         >
-          Cancel
+          {t("Cancel")}
         </button>
       </div>
     </div>
@@ -1961,13 +2008,13 @@ function EventPill({ event }) {
               onClick={() => event.onAction?.(event.job_id, "approve")}
               className="px-2 py-1 rounded bg-primary text-white text-[10px] font-bold hover:brightness-110 transition-all"
             >
-              Approve
+              {t("Approve")}
             </button>
             <button 
               onClick={() => event.onAction?.(event.job_id, "reject")}
               className="px-2 py-1 rounded bg-bg-card border border-divider text-secondary-text text-[10px] hover:bg-bg-page transition-all"
             >
-              Reject
+              {t("Reject")}
             </button>
           </div>
         )}
